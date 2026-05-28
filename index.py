@@ -17,7 +17,7 @@ app = FastAPI()
 HEX_KEY = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 API_KEY = bytes.fromhex(HEX_KEY)
 
-# IND Region માટે સાચા સર્વર્સ
+# IND Region માટે આ સર્વર બેસ્ટ છે
 MAJOR_HOST = "https://loginbp.common.ggbluefox.com" 
 
 def aes_encrypt(data_bytes):
@@ -55,59 +55,70 @@ def decode_id(jwt):
     try:
         p = jwt.split('.')[1]
         p += '=' * (4 - len(p) % 4)
-        return str(json.loads(base64.b64decode(p).decode()).get('account_id', 'N/A'))
+        data = json.loads(base64.b64decode(p).decode())
+        return str(data.get('account_id') or data.get('external_id', 'N/A'))
     except: return "N/A"
 
 @app.get("/gen")
 async def generate(region: str = "IND", name: str = "NOTA"):
     try:
         async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+            # 1. Credentials
             pwd = ''.join(random.choice('0123456789ABCDEF') for _ in range(64))
             
-            # 1. Register Guest
-            reg_json = (await client.post("https://100067.connect.garena.com/api/v2/oauth/guest:register", 
-                        content=json.dumps({"app_id": 100067, "client_type": 2, "password": pwd, "source": 2}), 
-                        headers={"Authorization": f"Signature {hmac.new(API_KEY, json.dumps({'app_id': 100067, 'client_type': 2, 'password': pwd, 'source': 2}, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()}"})).json()
-            uid = reg_json['data']['uid']
+            # 2. Register
+            reg_payload = json.dumps({"app_id": 100067, "client_type": 2, "password": pwd, "source": 2}, separators=(',', ':'))
+            sig_r = hmac.new(API_KEY, reg_payload.encode(), hashlib.sha256).hexdigest()
+            res_r = await client.post("https://100067.connect.garena.com/api/v2/oauth/guest:register", 
+                                     content=reg_payload, headers={"Authorization": f"Signature {sig_r}"})
+            uid = res_r.json()['data']['uid']
 
-            # 2. Token
-            tok_json = (await client.post("https://100067.connect.garena.com/api/v2/oauth/guest/token:grant", 
-                        content=json.dumps({"client_id": 100067, "client_secret": HEX_KEY, "client_type": 2, "password": pwd, "response_type": "token", "uid": uid}), 
-                        headers={"Authorization": f"Signature {hmac.new(API_KEY, json.dumps({'client_id': 100067, 'client_secret': HEX_KEY, 'client_type': 2, 'password': pwd, 'response_type': 'token', 'uid': uid}, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()}"})).json()
-            access_token, open_id = tok_json['data']['access_token'], tok_json['data']['open_id']
+            # 3. Token
+            tok_payload = json.dumps({"client_id": 100067, "client_secret": HEX_KEY, "client_type": 2, "password": pwd, "response_type": "token", "uid": uid}, separators=(',', ':'))
+            sig_t = hmac.new(API_KEY, tok_payload.encode(), hashlib.sha256).hexdigest()
+            res_t = await client.post("https://100067.connect.garena.com/api/v2/oauth/guest/token:grant", 
+                                     content=tok_payload, headers={"Authorization": f"Signature {sig_t}"})
+            t_data = res_t.json()['data']
+            access_token, open_id = t_data['access_token'], t_data['open_id']
 
-            # 3. Major Register (Create Name)
+            # 4. Major Register (Create Name)
             full_name = f"{name}{random.randint(100,999)}"
+            # Field 14 is Encoded OpenID for Character Creation
             reg_proto = await encode_field(1, full_name) + await encode_field(2, access_token) + await encode_field(3, open_id)
             await client.post(f"{MAJOR_HOST}/MajorRegister", content=aes_encrypt(reg_proto), headers={"ReleaseVersion": "OB53"})
 
-            # 4. Choose Region (Critical)
+            # રીજન સેટ કરવા માટે થોડી સેકન્ડ રાહ જુઓ (Sync)
+            await asyncio.sleep(1)
+
+            # 5. Choose Region
             region_proto = await encode_field(1, region.upper())
             await client.post(f"{MAJOR_HOST}/ChooseRegion", content=aes_encrypt(region_proto), 
                              headers={"Authorization": f"Bearer {access_token}", "ReleaseVersion": "OB53"})
 
-            # 5. Major Login (Get Numeric ID)
-            # OB53 Payload with Device Info
+            # 6. Major Login (Get Numeric ID)
+            # OB53 Full Payload Requirement
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             login_proto = (
                 await encode_field(1, ts) + 
                 await encode_field(2, "free fire") + 
+                await encode_field(3, 1, wire_type=0) + # Platform ID: 1 (Android)
                 await encode_field(20, open_id) + 
+                await encode_field(23, "4") +           # OpenID Type: 4 (Guest)
                 await encode_field(24, access_token) +
-                await encode_field(32, "7428b253defc164018c604a1ebbfebdf") # OB53 Signature
+                await encode_field(32, "7428b253defc164018c604a1ebbfebdf") # OB53 Signature Hash
             )
             
-            headers = {
+            headers_l = {
                 "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 12; SM-G998B)",
                 "ReleaseVersion": "OB53",
+                "X-GA": "v1 1",
                 "Content-Type": "application/x-www-form-urlencoded"
             }
-            res_l = await client.post(f"{MAJOR_HOST}/MajorLogin", content=aes_encrypt(login_proto), headers=headers)
+            res_l = await client.post(f"{MAJOR_HOST}/MajorLogin", content=aes_encrypt(login_proto), headers=headers_l)
 
-            # JWT Parsing from Binary Response
+            # JWT Parsing - Binary Safe
             jwt_token, real_id = "N/A", "Not Found"
-            raw_content = res_l.content
-            match = re.search(b'eyJ[a-zA-Z0-9\._\-]+', raw_content)
+            match = re.search(b'eyJ[a-zA-Z0-9\._\-]+', res_l.content)
             if match:
                 jwt_token = match.group(0).decode()
                 real_id = decode_id(jwt_token)
@@ -120,7 +131,7 @@ async def generate(region: str = "IND", name: str = "NOTA"):
                     "password": pwd,
                     "name": full_name,
                     "region": region,
-                    "jwt_token": jwt_token[:30] + "..." if jwt_token != "N/A" else "N/A"
+                    "jwt_token": jwt_token[:40] + "..." if jwt_token != "N/A" else "N/A"
                 }
             }
     except Exception as e:
