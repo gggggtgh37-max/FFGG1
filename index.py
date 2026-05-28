@@ -17,8 +17,9 @@ app = FastAPI()
 HEX_KEY = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 API_KEY = bytes.fromhex(HEX_KEY)
 
-# India Region માટે આ સર્વર સૌથી બેસ્ટ છે
-MAJOR_HOST = "https://loginbp.common.ggbluefox.com" 
+# IND Region માટે સાચો હોસ્ટ
+MAJOR_HOST = "https://loginbp.common.ggbluefox.com"
+CLIENT_HOST = "https://clientbp.common.ggbluefox.com"
 
 def aes_encrypt(data_bytes):
     key = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
@@ -43,21 +44,24 @@ async def encode_field(field_num, value, wire_type=2):
             l >>= 7
             if l == 0: break
         return bytes(tag_b) + len_b + val_b
-    else: # Varint/Integer
+    else: # Varint
         val_b = bytearray()
+        temp_val = value
         while True:
-            val_b.append((value & 0x7F) | (0x80 if value > 0x7F else 0x00))
-            value >>= 7
-            if value == 0: break
+            val_b.append((temp_val & 0x7F) | (0x80 if temp_val > 0x7F else 0x00))
+            temp_val >>= 7
+            if temp_val == 0: break
         return bytes(tag_b) + val_b
 
-def decode_id(jwt):
+def decode_numeric_id(jwt_token):
     try:
-        p = jwt.split('.')[1]
-        p += '=' * (4 - len(p) % 4)
-        data = json.loads(base64.b64decode(p).decode())
-        return str(data.get('account_id') or data.get('external_id', 'N/A'))
-    except: return "N/A"
+        payload = jwt_token.split('.')[1]
+        payload += '=' * (4 - len(payload) % 4)
+        data = json.loads(base64.b64decode(payload).decode('utf-8'))
+        # Account ID અથવા External ID માં Real ID હોય છે
+        return str(data.get('account_id') or data.get('external_id', 'Not Linked'))
+    except:
+        return "Not Found"
 
 @app.get("/gen")
 async def generate(region: str = "IND", name: str = "NOTA"):
@@ -67,60 +71,63 @@ async def generate(region: str = "IND", name: str = "NOTA"):
             device_id = "".join(random.choices("0123456789abcdef", k=16))
             
             # 1. Register Guest
-            reg_json = (await client.post("https://100067.connect.garena.com/api/v2/oauth/guest:register", 
-                        content=json.dumps({"app_id": 100067, "client_type": 2, "password": pwd, "source": 2}, separators=(',', ':')), 
-                        headers={"Authorization": f"Signature {hmac.new(API_KEY, json.dumps({'app_id': 100067, 'client_type': 2, 'password': pwd, 'source': 2}, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()}"}).json()
-            uid = reg_json['data']['uid']
+            reg_payload = json.dumps({"app_id": 100067, "client_type": 2, "password": pwd, "source": 2}, separators=(',', ':'))
+            sig_r = hmac.new(API_KEY, reg_payload.encode(), hashlib.sha256).hexdigest()
+            res_r = await client.post("https://100067.connect.garena.com/api/v2/oauth/guest:register", content=reg_payload, headers={"Authorization": f"Signature {sig_r}"})
+            uid = res_r.json()['data']['uid']
 
-            # 2. Grant Token
-            tok_json = (await client.post("https://100067.connect.garena.com/api/v2/oauth/guest/token:grant", 
-                        content=json.dumps({"client_id": 100067, "client_secret": HEX_KEY, "client_type": 2, "password": pwd, "response_type": "token", "uid": uid}, separators=(',', ':')), 
-                        headers={"Authorization": f"Signature {hmac.new(API_KEY, json.dumps({'client_id': 100067, 'client_secret': HEX_KEY, 'client_type': 2, 'password': pwd, 'response_type': 'token', 'uid': uid}, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()}"}).json()
-            access_token, open_id = tok_json['data']['access_token'], tok_json['data']['open_id']
+            # 2. Token Grant
+            tok_payload = json.dumps({"client_id": 100067, "client_secret": HEX_KEY, "client_type": 2, "password": pwd, "response_type": "token", "uid": uid}, separators=(',', ':'))
+            sig_t = hmac.new(API_KEY, tok_payload.encode(), hashlib.sha256).hexdigest()
+            res_t = await client.post("https://100067.connect.garena.com/api/v2/oauth/guest/token:grant", content=tok_payload, headers={"Authorization": f"Signature {sig_t}"})
+            t_data = res_t.json()['data']
+            access_token, open_id = t_data['access_token'], t_data['open_id']
 
             # 3. Major Register (Create Name)
             full_name = f"{name}{random.randint(100,999)}"
-            # Character Binding Payload
             reg_proto = await encode_field(1, full_name) + await encode_field(2, access_token) + await encode_field(3, open_id)
             await client.post(f"{MAJOR_HOST}/MajorRegister", content=aes_encrypt(reg_proto), headers={"ReleaseVersion": "OB53"})
 
-            # 4. Choose Region (Critical - numeric ID is minted here)
+            # 4. Choose Region (Compulsory for Numeric ID)
             region_proto = await encode_field(1, region.upper())
             await client.post(f"{MAJOR_HOST}/ChooseRegion", content=aes_encrypt(region_proto), 
                              headers={"Authorization": f"Bearer {access_token}", "ReleaseVersion": "OB53"})
 
-            await asyncio.sleep(1) # Server Sync માટે
+            # 5. Veteran Status (Active Beginner Guide)
+            # આ સ્ટેપ એકાઉન્ટને 'જન્મ' આપે છે
+            vet_proto = await encode_field(1, 3, wire_type=0) # 3 = Veteran
+            await client.post(f"{CLIENT_HOST}/ActiveBeginnerGuide", content=aes_encrypt(vet_proto), 
+                             headers={"Authorization": f"Bearer {access_token}", "ReleaseVersion": "OB53"})
 
-            # 5. Major Login (Get Token & ID)
-            # OB53 Full Device Emulation Payload
+            await asyncio.sleep(1) # Sync Delay
+
+            # 6. Major Login (Get Real ID via JWT)
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             login_proto = (
-                await encode_field(1, ts) +              # Timestamp
-                await encode_field(2, "free fire") +      # Game
-                await encode_field(3, 1, wire_type=0) +   # Platform Android
-                await encode_field(19, f"Google|{device_id}") + # Device ID
-                await encode_field(20, open_id) +         # OpenID
-                await encode_field(24, access_token) +    # Access Token
-                await encode_field(32, "7428b253defc164018c604a1ebbfebdf") # OB53 Signature
+                await encode_field(1, ts) +
+                await encode_field(2, "free fire") +
+                await encode_field(3, 1, wire_type=0) +
+                await encode_field(19, f"Google|{device_id}") +
+                await encode_field(20, open_id) +
+                await encode_field(24, access_token) +
+                await encode_field(32, "7428b253defc164018c604a1ebbfebdf")
             )
             
             headers_l = {
                 "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 12; SM-G998B)",
                 "ReleaseVersion": "OB53",
-                "X-GA": "v1 1",
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             res_l = await client.post(f"{MAJOR_HOST}/MajorLogin", content=aes_encrypt(login_proto), headers=headers_l)
 
-            # --- JWT એક્સટ્રેક્ટ કરવાની સૌથી સુરક્ષિત રીત ---
+            # JWT Parsing from Binary Response
             jwt_token, real_id = "N/A", "Not Found"
-            content = res_l.content
-            
-            # બાઈનરી ડેટામાં eyJ શોધો
-            match = re.search(b'eyJ[a-zA-Z0-9\._\-]+', content)
+            binary_data = res_l.content
+            # 'eyJ' (JWT header) શોધો
+            match = re.search(b'eyJ[a-zA-Z0-9\._\-]+', binary_data)
             if match:
                 jwt_token = match.group(0).decode()
-                real_id = decode_id(jwt_token)
+                real_id = decode_numeric_id(jwt_token)
 
             return {
                 "status": "success",
